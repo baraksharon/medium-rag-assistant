@@ -56,7 +56,7 @@ export default async function handler(req, res) {
       includeMetadata: true,
     });
 
-    // 3. Build context array (deduplicate by article to avoid same article multiple times)
+    // 3. Build context array
     const seen = new Set();
     const contextChunks = [];
     for (const match of queryRes.matches) {
@@ -64,6 +64,7 @@ export default async function handler(req, res) {
       contextChunks.push({
         article_id: String(meta.article_id ?? ''),
         title: String(meta.title ?? ''),
+        authors: String(meta.authors ?? ''),
         chunk: String(meta.chunk ?? ''),
         score: match.score,
       });
@@ -72,9 +73,10 @@ export default async function handler(req, res) {
 
     // 4. Build augmented user prompt
     const contextText = contextChunks
-      .map((c, i) =>
-        `[Article ${i + 1}]\nTitle: ${c.title}\nID: ${c.article_id}\n\n${c.chunk}`
-      )
+      .map((c, i) => {
+        const authorLine = c.authors ? `Authors: ${c.authors}\n` : '';
+        return `[Article ${i + 1}]\nTitle: ${c.title}\nID: ${c.article_id}\n${authorLine}\n${c.chunk}`;
+      })
       .join('\n\n---\n\n');
 
     const userPrompt = `Context from Medium articles:\n\n${contextText}\n\n---\n\nQuestion: ${question}`;
