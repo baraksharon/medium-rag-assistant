@@ -12,11 +12,17 @@ const OVERLAP_RATIO = 0.2;
 const EMBED_BATCH = 50;      // embeddings per API call
 const UPSERT_BATCH = 100;    // vectors per Pinecone upsert
 
-// Set LIMIT env var to test with fewer articles, e.g. LIMIT=100 node scripts/ingest.js
 const LIMIT = process.env.LIMIT ? parseInt(process.env.LIMIT) : null;
+const CHECKPOINT_FILE = path.join(__dirname, '.ingest-checkpoint');
+
+function sanitize(text) {
+  // Remove lone surrogate characters which are invalid UTF-8
+  return text.replace(/[\uD800-\uDFFF]/g, '');
+}
 
 function chunkText(text) {
   if (!text || text.trim().length === 0) return [];
+  text = sanitize(text);
   const chunkChars = CHUNK_SIZE * 4;
   const overlapChars = Math.floor(chunkChars * OVERLAP_RATIO);
   const stepChars = chunkChars - overlapChars;
@@ -32,6 +38,17 @@ function chunkText(text) {
   return chunks;
 }
 
+function saveCheckpoint(chunkIndex) {
+  fs.writeFileSync(CHECKPOINT_FILE, String(chunkIndex));
+}
+
+function loadCheckpoint() {
+  if (fs.existsSync(CHECKPOINT_FILE)) {
+    return parseInt(fs.readFileSync(CHECKPOINT_FILE, 'utf8'));
+  }
+  return 0;
+}
+
 async function embedBatch(openai, texts) {
   const res = await openai.embeddings.create({
     model: '4UHRUIN-text-embedding-3-small',
@@ -41,6 +58,9 @@ async function embedBatch(openai, texts) {
 }
 
 async function main() {
+  const args = process.argv.slice(2);
+  const force = args.includes('--force');
+
   const csvPath = path.join(__dirname, '../../medium-english-50mb.csv');
   if (!fs.existsSync(csvPath)) {
     console.error(`CSV not found at: ${csvPath}`);
@@ -70,26 +90,28 @@ async function main() {
   const pinecone = new Pinecone({ apiKey: process.env.PINECONE_API_KEY });
   const index = pinecone.index(process.env.PINECONE_INDEX_NAME);
 
-  // Check if already ingested
+  const resumeFrom = force ? 0 : loadCheckpoint();
   const stats = await index.describeIndexStats();
   if (stats.totalRecordCount > 0) {
     console.log(`Index already has ${stats.totalRecordCount} vectors.`);
-    const args = process.argv.slice(2);
-    if (!args.includes('--force')) {
+    if (!force && resumeFrom === 0) {
       console.log('Pass --force to re-ingest. Exiting.');
       return;
     }
-    console.log('--force flag set, continuing...');
+    if (resumeFrom > 0) {
+      console.log(`Checkpoint found — resuming from chunk ${resumeFrom}.`);
+    } else {
+      console.log('--force flag set, starting from scratch...');
+    }
   }
 
-  // Build all chunks first
-  const allChunks = []; // { id, text, metadata }
+  // Build all chunks
+  const allChunks = [];
   for (let i = 0; i < records.length; i++) {
     const row = records[i];
     const text = row.text || '';
     const title = (row.title || '').trim();
     const articleId = String(i);
-
     const chunks = chunkText(text);
     for (let j = 0; j < chunks.length; j++) {
       allChunks.push({
@@ -108,11 +130,12 @@ async function main() {
   }
   console.log(`Total chunks to embed: ${allChunks.length}`);
 
-  // Embed in batches and upsert to Pinecone
-  const vectors = [];
-  let done = 0;
+  const startFrom = resumeFrom;
 
-  for (let i = 0; i < allChunks.length; i += EMBED_BATCH) {
+  const vectors = [];
+  let done = startFrom;
+
+  for (let i = startFrom; i < allChunks.length; i += EMBED_BATCH) {
     const batch = allChunks.slice(i, i + EMBED_BATCH);
     const texts = batch.map(c => c.text);
 
@@ -120,9 +143,17 @@ async function main() {
     try {
       embeddings = await embedBatch(openai, texts);
     } catch (err) {
-      console.error(`Embedding error at batch ${i}: ${err.message}`);
+      console.error(`\nEmbedding error at batch ${i}: ${err.message}`);
       await new Promise(r => setTimeout(r, 2000));
-      embeddings = await embedBatch(openai, texts);
+      try {
+        embeddings = await embedBatch(openai, texts);
+      } catch (err2) {
+        // Skip this batch and save checkpoint so we can resume after it
+        console.error(`Skipping batch ${i} after second failure: ${err2.message}`);
+        saveCheckpoint(i + EMBED_BATCH);
+        done += batch.length;
+        continue;
+      }
     }
 
     for (let j = 0; j < batch.length; j++) {
@@ -138,10 +169,10 @@ async function main() {
       process.stdout.write(`\rEmbedded: ${done}/${allChunks.length}`);
     }
 
-    // Upsert when we have enough vectors
     if (vectors.length >= UPSERT_BATCH) {
       const toUpsert = vectors.splice(0, UPSERT_BATCH);
       await index.upsert({ records: toUpsert });
+      saveCheckpoint(i + EMBED_BATCH);
     }
   }
 
@@ -149,6 +180,9 @@ async function main() {
   for (let i = 0; i < vectors.length; i += UPSERT_BATCH) {
     await index.upsert({ records: vectors.slice(i, i + UPSERT_BATCH) });
   }
+
+  // Clear checkpoint on success
+  if (fs.existsSync(CHECKPOINT_FILE)) fs.unlinkSync(CHECKPOINT_FILE);
 
   console.log('\nIngestion complete!');
   const finalStats = await index.describeIndexStats();
